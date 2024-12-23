@@ -9,6 +9,8 @@ name: Publish ParadeDB (Docker)
 
 on:
   push:
+    branches:
+      - docker-build
     tags:
       - "v*"
   workflow_dispatch:
@@ -28,21 +30,18 @@ permissions:
   attestations: write
 
 jobs:
-  publish-paradedb-docker-image:
-    name: Publish ParadeDB Docker Image for PostgreSQL ${{ matrix.pg_version }}
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        pg_version: [13, 14, 15, 16, 17]
-    env:
-      default_pg_version: 17
-
+  version:
+    name: Retrieve GitHub Release Version
+    runs-on: ubicloud
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      COMMIT_SHA: ${{ steps.version.outputs.COMMIT_SHA }}
     steps:
-      - name: Checkout Git Repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Retrieve GitHub Release Version
-        id: version
+      - id: version
         run: |
           # If no workflow_dispatch version is provided, we use workflow tag trigger version
           if [ -z "${{ github.event.inputs.version }}" ]; then
@@ -54,85 +53,38 @@ jobs:
           fi
           echo "COMMIT_SHA=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
-      - name: Configure Depot CLI
-        uses: depot/setup-action@v1
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # The pg_version-tag Docker tag syntax is necessary for our CloudNativePG Helm chart
-      - name: Setup Docker Image tags
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: paradedb/paradedb
-          tags: |
-            type=raw,value=${{ matrix.pg_version }}-${{ steps.version.outputs.tag }}
-            type=raw,value=${{ steps.version.outputs.tag }}-pg${{ matrix.pg_version }}
-            type=raw,value=${{ steps.version.outputs.version }}-pg${{ matrix.pg_version }}
-            type=raw,value=latest-pg${{ matrix.pg_version }}
-            type=raw,value=latest,enable=${{ matrix.pg_version == env.default_pg_version }}
-            type=raw,value=${{ steps.version.outputs.tag }},enable=${{ matrix.pg_version == env.default_pg_version }}
-            type=raw,value=${{ steps.version.outputs.version }},enable=${{ matrix.pg_version == env.default_pg_version }}
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_ACCESS_TOKEN }}
-
-      # We don't need to use secret mounts for the build-args here because
-      # the PostHog secrets are public-facing and don't need to be kept secret.
-      - name: Build and Push Docker Image to Docker Hub
-        id: build-push
-        uses: depot/build-push-action@v1
-        with:
-          context: .
-          build-args: |
-            PG_VERSION_MAJOR=${{ matrix.pg_version }}
-            POSTHOG_API_KEY=${{ secrets.POSTHOG_API_KEY }}
-            POSTHOG_HOST=${{ secrets.POSTHOG_HOST }}
-            COMMIT_SHA=${{ steps.version.outputs.COMMIT_SHA }}
-            PARADEDB_TELEMETRY=true
-          platforms: linux/amd64,linux/arm64
-          file: docker/Dockerfile
-          push: true
-          sbom: true
-          provenance: mode=max
-          project: ${{ secrets.DEPOT_PROJECT }}
-          token: ${{ secrets.DEPOT_TOKEN }}
-          tags: ${{ steps.meta.outputs.tags }}
-
-      - name: Sign and Attest Build Provenance
-        uses: actions/attest-build-provenance@v1
-        with:
-          subject-name: index.docker.io/paradedb/paradedb
-          subject-digest: ${{ steps.build-push.outputs.digest }}
-          push-to-registry: true
-
-  publish-paradedb-helm-chart:
-    name: Publish ParadeDB Helm Chart for PostgreSQL ${{ matrix.pg_version }}
-    runs-on: ubuntu-latest
+  docker:
+    needs: version
+    name: Publish ParadeDB Docker Image for PostgreSQL ${{ matrix.pg_version }}
     strategy:
       matrix:
-        pg_version: [17]
+        # pg_version: [13, 14, 15, 16, 17]
+        pg_version: [16, 17]
+    uses: enescakir/multi-platform-docker/.github/workflows/build.yml@main
+    with:
+      image-name: enescakir/test-repo
+      amd64-runner: ubicloud-standard-16
+      arm64-runner: ubicloud-standard-16-arm
+      metadata-tags: |
+        type=raw,value=${{ matrix.pg_version }}-${{ needs.version.outputs.tag }}
+        type=raw,value=${{ needs.version.outputs.tag }}-pg${{ matrix.pg_version }}
+        type=raw,value=${{ needs.version.outputs.version }}-pg${{ matrix.pg_version }}
+        type=raw,value=latest-pg${{ matrix.pg_version }}
+        type=raw,value=latest,enable=${{ matrix.pg_version == 17}}
+        type=raw,value=${{ needs.version.outputs.tag }},enable=${{ matrix.pg_version == 17}}
+        type=raw,value=${{ needs.version.outputs.version }},enable=${{ matrix.pg_version == 17}}
+      build-args: |
+        PG_VERSION_MAJOR=${{ matrix.pg_version }}
+        POSTHOG_API_KEY=AA
+        POSTHOG_HOST=BB
+        COMMIT_SHA=${{ needs.version.outputs.COMMIT_SHA }}
+        PARADEDB_TELEMETRY=true
+      dockerfile: docker/Dockerfile
+      push: true
+      sbom: true
+      provenance: mode=max
+      artifact-suffix: -${{ matrix.pg_version}} 
+    secrets:
+      registry-username: ${{ secrets.DOCKERHUB_USERNAME }}
+      registry-password: ${{ secrets.DOCKERHUB_ACCESS_TOKEN }}
 
-    steps:
-      - name: Retrieve GitHub Release Version
-        id: version
-        run: |
-          # If no workflow_dispatch version is provided, we use workflow tag trigger version
-          if [ -z "${{ github.event.inputs.version }}" ]; then
-            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-          else
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Trigger paradedb/charts Release Workflow
-        uses: multinarity/workflow-dispatch@master
-        with:
-          token: ${{ secrets.GHA_CREATE_RELEASE_PAT }}
-          workflow: paradedb-publish-chart.yml
-          repo: paradedb/charts
-          ref: main
-          inputs: '{ "appVersion": "${{ steps.version.outputs.version }}" }'
